@@ -1,0 +1,1264 @@
+package cmd
+
+import (
+	"bytes"
+	"errors"
+	"fmt"
+	"testing"
+
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+)
+
+// stubLocalPostgresHappy registers fake exec results and filesystem state
+// so PostgresBootstrapRunner.Run() succeeds end-to-end without touching
+// a real PG. Use in higher-level setup tests that exercise the full
+// orchestration but don't validate bootstrap internals.
+func stubLocalPostgresHappy(r *SetupRunner) {
+	exec := r.Exec.(*FakeExecRunner)
+	fs := r.FS.(*FakeFileSystem)
+
+	// PGDG 16 detected
+	fs.Files["/usr/pgsql-16/bin/psql"] = []byte("")
+	exec.Results["/usr/pgsql-16/bin/psql --version"] = FakeExecResult{
+		Stdout: "psql (PostgreSQL) 16.4\n",
+	}
+	// Cluster already initialized
+	fs.Files["/var/lib/pgsql/16/data/PG_VERSION"] = []byte("16\n")
+	// Default config files present
+	fs.Files["/var/lib/pgsql/16/data/pg_hba.conf"] = []byte(
+		"# TYPE  DATABASE        USER            ADDRESS                 METHOD\n",
+	)
+	fs.Files["/var/lib/pgsql/16/data/postgresql.conf"] = []byte("")
+	// SQL ops via runuser psql succeed; rolpassword is SCRAM-SHA-256
+	exec.Results["runuser -u postgres"] = FakeExecResult{Stdout: "SCRAM-SHA-256$x"}
+	// Final connection test
+	exec.Results["/usr/pgsql-16/bin/psql postgresql://postgres@127.0.0.1:5432/heimdall-server-production -c"] = FakeExecResult{}
+	exec.Results["/usr/pgsql-16/bin/psql postgresql://postgres@localhost:5432/heimdall-server-production -c"] = FakeExecResult{}
+}
+
+func newTestSetupRunner() (*SetupRunner, *bytes.Buffer, *bytes.Buffer) {
+	out := new(bytes.Buffer)
+	errOut := new(bytes.Buffer)
+	r := &SetupRunner{
+		Exec: &FakeExecRunner{
+			Results: make(map[string]FakeExecResult),
+		},
+		Systemd: &FakeSystemdRunner{
+			ActiveServices: make(map[string]bool),
+			Properties:     make(map[string]string),
+		},
+		Env: &FakeEnvManager{
+			Env: make(map[string]string),
+		},
+		FS:     NewFakeFileSystem(),
+		DB:     &FakeDBConnector{},
+		Out:    out,
+		ErrOut: errOut,
+		Paths:  DefaultPaths(),
+	}
+	return r, out, errOut
+}
+
+// --- Command-level tests ---
+
+func TestSetupCmd_Help(t *testing.T) {
+	cmd := NewSetupCmd(nil)
+	out := new(bytes.Buffer)
+	cmd.SetOut(out)
+	cmd.SetArgs([]string{"--help"})
+	err := cmd.Execute()
+	require.NoError(t, err)
+	assert.Contains(t, out.String(), "setup")
+	assert.Contains(t, out.String(), "--interactive")
+	assert.Contains(t, out.String(), "--skip-db")
+	assert.Contains(t, out.String(), "--skip-tls")
+	assert.Contains(t, out.String(), "--reconfigure")
+	assert.Contains(t, out.String(), "--external-url")
+	assert.Contains(t, out.String(), "--tls-cert")
+	assert.Contains(t, out.String(), "--tls-key")
+}
+
+func TestSetupCmd_UnknownFlag(t *testing.T) {
+	cmd := NewSetupCmd(nil)
+	cmd.SetArgs([]string{"--bogus-flag"})
+	err := cmd.Execute()
+	assert.Error(t, err)
+}
+
+func TestSetupCmd_TlsCertWithoutKey(t *testing.T) {
+	r, _, _ := newTestSetupRunner()
+	cmd := NewSetupCmd(r)
+	cmd.SetArgs([]string{"--tls-cert", "/tmp/cert.pem"})
+	err := cmd.Execute()
+	assert.Error(t, err)
+	assert.Contains(t, err.Error(), "--tls-cert and --tls-key must be provided together")
+}
+
+func TestSetupCmd_TlsKeyWithoutCert(t *testing.T) {
+	r, _, _ := newTestSetupRunner()
+	cmd := NewSetupCmd(r)
+	cmd.SetArgs([]string{"--tls-key", "/tmp/key.pem"})
+	err := cmd.Execute()
+	assert.Error(t, err)
+	assert.Contains(t, err.Error(), "--tls-cert and --tls-key must be provided together")
+}
+
+func TestSetupCmd_Reconfigure(t *testing.T) {
+	r, out, _ := newTestSetupRunner()
+	cmd := NewSetupCmd(r)
+	cmd.SetArgs([]string{"--reconfigure", "--non-interactive"})
+	err := cmd.Execute()
+	require.NoError(t, err)
+	output := out.String()
+	assert.Contains(t, output, "Step 1/7: Configuration")
+	assert.Contains(t, output, "Reconfiguration complete")
+	// Should NOT contain steps 2-7
+	assert.NotContains(t, output, "Step 2/7")
+	assert.NotContains(t, output, "Step 3/7")
+}
+
+func TestSetupCmd_SkipDB(t *testing.T) {
+	r, out, _ := newTestSetupRunner()
+	cmd := NewSetupCmd(r)
+	cmd.SetArgs([]string{"--skip-db", "--skip-tls", "--non-interactive"})
+	err := cmd.Execute()
+	require.NoError(t, err)
+	output := out.String()
+	assert.Contains(t, output, "Step 1/7: Configuration")
+	assert.Contains(t, output, "skipped")
+	// Steps 2,3,4 should show "(skipped" in their headers
+	assert.Contains(t, output, "PostgreSQL bootstrap (skipped")
+	assert.Contains(t, output, "Connection test (skipped")
+	assert.Contains(t, output, "Database migrations (skipped")
+}
+
+func TestSetupCmd_ExternalDBSkipsBootstrap(t *testing.T) {
+	r, out, _ := newTestSetupRunner()
+	// Set up fake exec for db-setup binary
+	r.Exec.(*FakeExecRunner).Results["heimdall-server-db-setup "] = FakeExecResult{}
+	cmd := NewSetupCmd(r)
+	cmd.SetArgs([]string{
+		"--non-interactive",
+		"--skip-tls",
+		"--db-host", "db.example.com",
+		"--db-password", "secret",
+	})
+	err := cmd.Execute()
+	require.NoError(t, err)
+	output := out.String()
+	// Step 2 should be skipped (external DB)
+	assert.Contains(t, output, "skipped")
+	assert.Contains(t, output, "external database")
+	// Step 3 (connection test) should still run
+	assert.Contains(t, output, "Connection test")
+}
+
+func TestSetupCmd_NonInteractiveAutoGeneratesPassword(t *testing.T) {
+	r, _, _ := newTestSetupRunner()
+	stubLocalPostgresHappy(r)
+	cmd := NewSetupCmd(r)
+	cmd.SetArgs([]string{"--non-interactive", "--skip-tls"})
+	err := cmd.Execute()
+	require.NoError(t, err)
+	env := r.Env.(*FakeEnvManager).Env
+	assert.NotEmpty(t, env["DATABASE_PASSWORD"], "password should be auto-generated")
+}
+
+func TestSetupCmd_AllStepsRunWithMocks(t *testing.T) {
+	r, out, _ := newTestSetupRunner()
+	r.DB.(*FakeDBConnector).Tables = 5
+	stubLocalPostgresHappy(r)
+	r.Exec.(*FakeExecRunner).Results["heimdall-server-db-setup "] = FakeExecResult{}
+	cmd := NewSetupCmd(r)
+	cmd.SetArgs([]string{"--non-interactive", "--skip-tls", "--db-password", "testpass"})
+	err := cmd.Execute()
+	require.NoError(t, err)
+	output := out.String()
+	assert.Contains(t, output, "Step 1/7")
+	assert.Contains(t, output, "Step 3/7")
+	assert.Contains(t, output, "Step 4/7")
+	assert.Contains(t, output, "Step 7/7")
+}
+
+func TestSetupCmd_ConnectionTestFailure(t *testing.T) {
+	r, _, _ := newTestSetupRunner()
+	stubLocalPostgresHappy(r)
+	r.DB.(*FakeDBConnector).ConnErr = errors.New("connection refused")
+	cmd := NewSetupCmd(r)
+	cmd.SetArgs([]string{"--non-interactive", "--skip-tls", "--db-password", "testpass"})
+	err := cmd.Execute()
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "connection test failed")
+}
+
+// --- stepConfigure preservation tests ---
+
+func TestStepConfigure_PreservesExistingSecrets(t *testing.T) {
+	r, _, _ := newTestSetupRunner()
+	// Simulate existing backend.env with secrets already set
+	r.Env.(*FakeEnvManager).Env = map[string]string{
+		"JWT_SECRET":        "existing-jwt-secret-do-not-overwrite",
+		"API_KEY_SECRET":    "existing-api-key-do-not-overwrite",
+		"DATABASE_PASSWORD": "existing-db-password",
+		"NODE_ENV":          "production",
+		"PORT":              "3000",
+	}
+
+	err := r.stepConfigure()
+	require.NoError(t, err)
+
+	env := r.Env.(*FakeEnvManager).Env
+	assert.Equal(t, "existing-jwt-secret-do-not-overwrite", env["JWT_SECRET"], "JWT_SECRET should be preserved")
+	assert.Equal(t, "existing-api-key-do-not-overwrite", env["API_KEY_SECRET"], "API_KEY_SECRET should be preserved")
+	assert.Equal(t, "existing-db-password", env["DATABASE_PASSWORD"], "DATABASE_PASSWORD should be preserved")
+}
+
+func TestStepConfigure_GeneratesSecretsWhenMissing(t *testing.T) {
+	r, out, _ := newTestSetupRunner()
+	// Empty env — no existing secrets
+	r.Env.(*FakeEnvManager).Env = map[string]string{}
+
+	err := r.stepConfigure()
+	require.NoError(t, err)
+
+	env := r.Env.(*FakeEnvManager).Env
+	assert.NotEmpty(t, env["JWT_SECRET"], "JWT_SECRET should be generated")
+	assert.NotEmpty(t, env["API_KEY_SECRET"], "API_KEY_SECRET should be generated")
+	assert.NotEmpty(t, env["DATABASE_PASSWORD"], "DATABASE_PASSWORD should be generated")
+	assert.Contains(t, out.String(), "auto-generated")
+}
+
+func TestStepConfigure_WritesAllExpectedKeys(t *testing.T) {
+	r, _, _ := newTestSetupRunner()
+	r.Env.(*FakeEnvManager).Env = map[string]string{}
+
+	err := r.stepConfigure()
+	require.NoError(t, err)
+
+	env := r.Env.(*FakeEnvManager).Env
+	expectedKeys := []string{
+		"NODE_ENV", "PORT", "DATABASE_HOST", "DATABASE_PORT",
+		"DATABASE_USERNAME", "DATABASE_PASSWORD", "DATABASE_NAME",
+		"JWT_SECRET", "JWT_EXPIRE_TIME", "API_KEY_SECRET",
+		"NGINX_HOST", "EXTERNAL_URL", "ADMIN_EMAIL",
+	}
+	for _, key := range expectedKeys {
+		assert.Contains(t, env, key, "missing key: %s", key)
+	}
+}
+
+func TestStepConfigure_CLIFlagOverridesExisting(t *testing.T) {
+	r, _, _ := newTestSetupRunner()
+	r.Env.(*FakeEnvManager).Env = map[string]string{
+		"DATABASE_HOST": "old-host.example.com",
+	}
+	r.DBHost = "new-host.example.com"
+
+	err := r.stepConfigure()
+	require.NoError(t, err)
+
+	env := r.Env.(*FakeEnvManager).Env
+	assert.Equal(t, "new-host.example.com", env["DATABASE_HOST"])
+}
+
+func TestStepConfigure_ExplicitPasswordOverridesExisting(t *testing.T) {
+	r, _, _ := newTestSetupRunner()
+	r.Env.(*FakeEnvManager).Env = map[string]string{
+		"DATABASE_PASSWORD": "old-password",
+	}
+	r.DBPassword = "new-explicit-password"
+
+	err := r.stepConfigure()
+	require.NoError(t, err)
+
+	env := r.Env.(*FakeEnvManager).Env
+	assert.Equal(t, "new-explicit-password", env["DATABASE_PASSWORD"])
+}
+
+func TestStepConfigure_WritesNginxHost(t *testing.T) {
+	r, _, _ := newTestSetupRunner()
+	r.Env.(*FakeEnvManager).Env = map[string]string{}
+
+	err := r.stepConfigure()
+	require.NoError(t, err)
+
+	env := r.Env.(*FakeEnvManager).Env
+	assert.Equal(t, "localhost", env["NGINX_HOST"])
+}
+
+func TestStepConfigure_WritesAdminEmail(t *testing.T) {
+	r, _, _ := newTestSetupRunner()
+	r.Env.(*FakeEnvManager).Env = map[string]string{}
+
+	err := r.stepConfigure()
+	require.NoError(t, err)
+
+	env := r.Env.(*FakeEnvManager).Env
+	assert.Equal(t, "admin@heimdall.local", env["ADMIN_EMAIL"])
+}
+
+func TestStepConfigure_DerivesExternalURLFromNginxHost(t *testing.T) {
+	r, _, _ := newTestSetupRunner()
+	r.Env.(*FakeEnvManager).Env = map[string]string{
+		"NGINX_HOST": "heimdall.example.com",
+	}
+
+	err := r.stepConfigure()
+	require.NoError(t, err)
+
+	env := r.Env.(*FakeEnvManager).Env
+	assert.Equal(t, "https://heimdall.example.com", env["EXTERNAL_URL"])
+}
+
+func TestStepConfigure_SetsFilePermissions(t *testing.T) {
+	r, _, _ := newTestSetupRunner()
+	r.Env.(*FakeEnvManager).Env = map[string]string{}
+
+	err := r.stepConfigure()
+	require.NoError(t, err)
+
+	// Verify chown and chmod were called
+	exec := r.Exec.(*FakeExecRunner)
+	foundChown := false
+	foundChmod := false
+	for _, call := range exec.Calls {
+		if call.Name == "chown" {
+			foundChown = true
+		}
+		if call.Name == "chmod" {
+			foundChmod = true
+		}
+	}
+	assert.True(t, foundChown, "chown should be called on env file")
+	assert.True(t, foundChmod, "chmod should be called on env file")
+}
+
+// --- stepPostgresBootstrap tests ---
+// stepPostgresBootstrap delegates to PostgresBootstrapRunner. The runner
+// itself is exhaustively tested in postgres_bootstrap_test.go; here we
+// just verify the wiring (inputs are forwarded, errors propagate, no
+// shell-out to the old script remains).
+
+func TestStepPostgresBootstrap_DelegatesToNativeRunner(t *testing.T) {
+	r, _, _ := newTestSetupRunner()
+	r.DBUser = "heimdall"
+	r.DBPassword = "secret"
+	r.DBHost = "127.0.0.1"
+	r.DBPort = 5432
+	r.DBName = "heimdall-server-production"
+
+	exec := r.Exec.(*FakeExecRunner)
+	fs := r.FS.(*FakeFileSystem)
+
+	fs.Files["/usr/pgsql-16/bin/psql"] = []byte("")
+	exec.Results["/usr/pgsql-16/bin/psql --version"] = FakeExecResult{
+		Stdout: "psql (PostgreSQL) 16.4\n",
+	}
+	fs.Files["/var/lib/pgsql/16/data/PG_VERSION"] = []byte("16\n")
+	fs.Files["/var/lib/pgsql/16/data/pg_hba.conf"] = []byte(
+		"# TYPE  DATABASE        USER            ADDRESS                 METHOD\n",
+	)
+	fs.Files["/var/lib/pgsql/16/data/postgresql.conf"] = []byte("")
+	exec.Results["runuser -u postgres"] = FakeExecResult{Stdout: "SCRAM-SHA-256$x"}
+	exec.Results["/usr/pgsql-16/bin/psql postgresql://heimdall@127.0.0.1:5432/heimdall-server-production -c"] = FakeExecResult{}
+
+	err := r.stepPostgresBootstrap()
+
+	require.NoError(t, err)
+
+	// Verify the OLD shell-out is gone.
+	for _, c := range exec.Calls {
+		require.NotContains(t, c.Name, "postgres-setup.sh",
+			"native runner must not invoke postgres-setup.sh")
+	}
+}
+
+func TestStepPostgresBootstrap_PropagatesValidationError(t *testing.T) {
+	r, _, _ := newTestSetupRunner()
+	r.DBUser = ""
+	r.DBPassword = ""
+
+	err := r.stepPostgresBootstrap()
+
+	require.Error(t, err, "missing credentials must surface as an error")
+}
+
+func TestStepPostgresBootstrap_SkipsForRemoteHost(t *testing.T) {
+	r, out, _ := newTestSetupRunner()
+	r.DBHost = "db.internal"
+	r.DBUser = "u"
+	r.DBPassword = "p"
+
+	err := r.stepPostgresBootstrap()
+
+	require.NoError(t, err, "remote host short-circuits with no error")
+	assert.Contains(t, out.String(), "skipping",
+		"output must explain remote host was skipped")
+}
+
+// --- stepConnectionTest tests ---
+
+func TestStepConnectionTest_Success(t *testing.T) {
+	r, out, _ := newTestSetupRunner()
+	r.DBHost = "localhost"
+	r.DBPort = 5432
+	r.DBUser = "postgres"
+	r.DBPassword = "secret"
+	r.DBName = "heimdall-server-production"
+
+	err := r.stepConnectionTest()
+	require.NoError(t, err)
+	assert.Contains(t, out.String(), "Connected to localhost:5432/heimdall-server-production")
+}
+
+func TestStepConnectionTest_Failure(t *testing.T) {
+	r, _, _ := newTestSetupRunner()
+	r.DB.(*FakeDBConnector).ConnErr = errors.New("connection refused")
+	r.DBHost = "db.example.com"
+	r.DBPort = 5432
+	r.DBName = "mydb"
+
+	err := r.stepConnectionTest()
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "cannot connect to db.example.com:5432/mydb")
+}
+
+// --- stepMigrations tests ---
+
+func TestStepMigrations_Success(t *testing.T) {
+	r, out, _ := newTestSetupRunner()
+	r.Exec.(*FakeExecRunner).Results["heimdall-server-db-setup"] = FakeExecResult{ExitCode: 0}
+
+	err := r.stepMigrations()
+	require.NoError(t, err)
+	assert.Contains(t, out.String(), "Database migrations complete")
+}
+
+func TestStepMigrations_Failure(t *testing.T) {
+	r, _, _ := newTestSetupRunner()
+	r.Exec.(*FakeExecRunner).Results["heimdall-server-db-setup"] = FakeExecResult{ExitCode: 1}
+
+	err := r.stepMigrations()
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "exited with code 1")
+}
+
+// --- stepStartService tests ---
+
+func TestStepStartService_Success(t *testing.T) {
+	r, out, _ := newTestSetupRunner()
+	r.Env.(*FakeEnvManager).Env["DATABASE_PASSWORD"] = "secret"
+
+	err := r.stepStartService()
+	require.NoError(t, err)
+	assert.Contains(t, out.String(), "Service enabled and started")
+	assert.Contains(t, r.Systemd.(*FakeSystemdRunner).Actions, "enable-now:"+ServiceName)
+}
+
+func TestStepStartService_MissingPassword(t *testing.T) {
+	r, _, _ := newTestSetupRunner()
+	r.Env.(*FakeEnvManager).Env = map[string]string{}
+
+	err := r.stepStartService()
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "DATABASE_PASSWORD is not set")
+}
+
+func TestStepStartService_SystemdFails(t *testing.T) {
+	r, _, _ := newTestSetupRunner()
+	r.Env.(*FakeEnvManager).Env["DATABASE_PASSWORD"] = "secret"
+	r.Systemd.(*FakeSystemdRunner).Err = errors.New("unit not found")
+
+	err := r.stepStartService()
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "enabling service")
+}
+
+// --- isLocalHost tests ---
+
+func TestIsLocalHost(t *testing.T) {
+	tests := []struct {
+		host  string
+		local bool
+	}{
+		{"localhost", true},
+		{"", true},
+		{"127.0.0.1", true},
+		{"::1", true},
+		{"  localhost  ", true},
+		{"db.example.com", false},
+		{"192.168.1.100", false},
+		{"10.0.0.1", false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.host, func(t *testing.T) {
+			assert.Equal(t, tt.local, isLocalHost(tt.host))
+		})
+	}
+}
+
+// --- resolveExternalHost tests ---
+
+func TestResolveExternalHost_FromExternalURL(t *testing.T) {
+	r, _, _ := newTestSetupRunner()
+	r.ExternalURL = "https://heimdall.example.com"
+
+	host, url := r.resolveExternalHost()
+	assert.Equal(t, "heimdall.example.com", host)
+	assert.Equal(t, "https://heimdall.example.com", url)
+}
+
+func TestResolveExternalHost_StripsPortAndPath(t *testing.T) {
+	r, _, _ := newTestSetupRunner()
+	r.ExternalURL = "https://heimdall.example.com:443/api"
+
+	host, _ := r.resolveExternalHost()
+	assert.Equal(t, "heimdall.example.com", host)
+}
+
+func TestResolveExternalHost_FallsBackToHostname(t *testing.T) {
+	r, _, _ := newTestSetupRunner()
+	r.Exec.(*FakeExecRunner).Results["hostname -f"] = FakeExecResult{Stdout: "myserver.local"}
+
+	host, url := r.resolveExternalHost()
+	assert.Equal(t, "myserver.local", host)
+	assert.Equal(t, "https://myserver.local", url)
+}
+
+func TestResolveExternalHost_FallsBackToLocalhost(t *testing.T) {
+	r, _, _ := newTestSetupRunner()
+	// Both hostname commands return empty
+	r.Exec.(*FakeExecRunner).Results["hostname -f"] = FakeExecResult{Stdout: ""}
+	r.Exec.(*FakeExecRunner).Results["hostname"] = FakeExecResult{Stdout: ""}
+
+	host, _ := r.resolveExternalHost()
+	assert.Equal(t, "localhost", host)
+}
+
+// --- Interactive setup tests (topology-aware wizard) ---
+
+// Test: External DB + External SSL (most common enterprise deployment)
+func TestInteractive_ExternalDB_ExternalSSL(t *testing.T) {
+	r, out, _ := newTestSetupRunner()
+	r.Interactive = true
+	r.Prompter = &FakePrompter{
+		Selects: map[string]int{
+			"Database setup": 1, // External PostgreSQL
+			"TLS/SSL setup":  1, // External SSL termination
+		},
+		Inputs: map[string]string{
+			"Database host":     "db.prod.example.com",
+			"Database port":     "5433",
+			"Database user":     "heimdall_app",
+			"Database password": "Str0ng!Pass#2026",
+			"Confirm password":  "Str0ng!Pass#2026",
+			"Database name":     "heimdall_prod",
+			"External URL":      "https://heimdall.example.com",
+			"Admin email":       "admin@example.com",
+		},
+		IsTTY: true,
+	}
+
+	err := r.stepConfigure()
+	require.NoError(t, err)
+
+	env := r.Env.(*FakeEnvManager).Env
+	assert.Equal(t, "db.prod.example.com", env["DATABASE_HOST"])
+	assert.Equal(t, "5433", env["DATABASE_PORT"])
+	assert.Equal(t, "heimdall_app", env["DATABASE_USERNAME"])
+	assert.Equal(t, "Str0ng!Pass#2026", env["DATABASE_PASSWORD"])
+	assert.Equal(t, "heimdall_prod", env["DATABASE_NAME"])
+	assert.Equal(t, "https://heimdall.example.com", env["EXTERNAL_URL"])
+	assert.Equal(t, "admin@example.com", env["ADMIN_EMAIL"])
+	assert.True(t, r.SkipTLS, "external SSL should set SkipTLS")
+	// SkipDB stays false — we still want connection test + migrations
+	assert.False(t, r.SkipDB, "external DB should NOT set SkipDB (migrations still needed)")
+	assert.Contains(t, out.String(), "Configuration saved")
+}
+
+// Test: Local DB + Caddy (default single-box deployment)
+func TestInteractive_LocalDB_Caddy(t *testing.T) {
+	r, _, _ := newTestSetupRunner()
+	r.Interactive = true
+	r.Prompter = &FakePrompter{
+		Selects: map[string]int{
+			"Database setup": 0, // Local PostgreSQL
+			"TLS/SSL setup":  0, // Caddy
+		},
+		Inputs: map[string]string{
+			"Database password": "localpass",
+			"Confirm password":  "localpass",
+			"External URL":      "https://heimdall.local",
+			"Admin email":       "admin@heimdall.local",
+		},
+		IsTTY: true,
+	}
+
+	err := r.stepConfigure()
+	require.NoError(t, err)
+
+	env := r.Env.(*FakeEnvManager).Env
+	assert.Equal(t, "localhost", env["DATABASE_HOST"], "local DB uses localhost")
+	assert.Equal(t, "5432", env["DATABASE_PORT"], "local DB uses default port")
+	assert.Equal(t, "postgres", env["DATABASE_USERNAME"], "local DB uses default user")
+	assert.Equal(t, "localpass", env["DATABASE_PASSWORD"])
+	assert.False(t, r.SkipTLS, "Caddy choice should leave SkipTLS false")
+}
+
+// Test: External DB + BYO cert
+func TestInteractive_ExternalDB_BYOCert(t *testing.T) {
+	r, _, _ := newTestSetupRunner()
+	r.Interactive = true
+	r.Prompter = &FakePrompter{
+		Selects: map[string]int{
+			"Database setup": 1, // External PostgreSQL
+			"TLS/SSL setup":  2, // BYO certificate
+		},
+		Inputs: map[string]string{
+			"Database host":      "db.example.com",
+			"Database port":      "5432",
+			"Database user":      "heimdall",
+			"Database password":  "secret",
+			"Confirm password":   "secret",
+			"Database name":      "heimdall_prod",
+			"TLS certificate path": "/etc/pki/tls/certs/heimdall.crt",
+			"TLS private key path": "/etc/pki/tls/private/heimdall.key",
+			"External URL":       "https://heimdall.example.com",
+			"Admin email":        "admin@example.com",
+		},
+		IsTTY: true,
+	}
+
+	err := r.stepConfigure()
+	require.NoError(t, err)
+
+	assert.Equal(t, "/etc/pki/tls/certs/heimdall.crt", r.TLSCert, "BYO cert path set on runner")
+	assert.Equal(t, "/etc/pki/tls/private/heimdall.key", r.TLSKey, "BYO key path set on runner")
+	assert.False(t, r.SkipTLS, "BYO cert should leave SkipTLS false (Caddy still runs)")
+}
+
+// Test: Local DB + No TLS (development mode)
+func TestInteractive_LocalDB_NoTLS(t *testing.T) {
+	r, _, _ := newTestSetupRunner()
+	r.Interactive = true
+	r.Prompter = &FakePrompter{
+		Selects: map[string]int{
+			"Database setup": 0, // Local PostgreSQL
+			"TLS/SSL setup":  3, // No TLS
+		},
+		Inputs: map[string]string{
+			"Database password": "devpass",
+			"Confirm password":  "devpass",
+			"External URL":      "",
+			"Admin email":       "admin@heimdall.local",
+		},
+		IsTTY: true,
+	}
+
+	err := r.stepConfigure()
+	require.NoError(t, err)
+
+	assert.True(t, r.SkipTLS, "no TLS choice should set SkipTLS")
+}
+
+// Test: Re-run with existing config keeps current values
+func TestInteractive_RerunKeepCurrent(t *testing.T) {
+	r, out, _ := newTestSetupRunner()
+	r.Interactive = true
+	r.Env.(*FakeEnvManager).Env = map[string]string{
+		"DATABASE_HOST":     "existing.db.com",
+		"DATABASE_PORT":     "5433",
+		"DATABASE_USERNAME": "myuser",
+		"DATABASE_PASSWORD": "existing-pass",
+		"DATABASE_NAME":     "mydb",
+		"EXTERNAL_URL":      "https://heimdall.existing.com",
+		"ADMIN_EMAIL":       "admin@existing.com",
+		"JWT_SECRET":        "existing-jwt",
+		"API_KEY_SECRET":    "existing-api",
+	}
+	r.Prompter = &FakePrompter{
+		Selects: map[string]int{
+			"What would you like to do?": 0, // Re-run with current config
+		},
+		IsTTY: true,
+	}
+
+	err := r.stepConfigure()
+	require.NoError(t, err)
+
+	env := r.Env.(*FakeEnvManager).Env
+	assert.Equal(t, "existing.db.com", env["DATABASE_HOST"], "existing DB host preserved")
+	assert.Equal(t, "5433", env["DATABASE_PORT"], "existing DB port preserved")
+	assert.Equal(t, "myuser", env["DATABASE_USERNAME"], "existing DB user preserved")
+	assert.Equal(t, "existing-pass", env["DATABASE_PASSWORD"], "existing password preserved")
+	assert.Equal(t, "mydb", env["DATABASE_NAME"], "existing DB name preserved")
+	assert.Equal(t, "existing-jwt", env["JWT_SECRET"], "existing JWT secret preserved")
+	assert.Equal(t, "existing-api", env["API_KEY_SECRET"], "existing API key preserved")
+	assert.Contains(t, out.String(), "Re-running with existing configuration")
+}
+
+// Test: Re-run -> edit config changes one value
+func TestInteractive_RerunEditConfig(t *testing.T) {
+	r, _, _ := newTestSetupRunner()
+	r.Interactive = true
+	r.Env.(*FakeEnvManager).Env = map[string]string{
+		"DATABASE_HOST":     "old-host.example.com",
+		"DATABASE_PORT":     "5432",
+		"DATABASE_USERNAME": "postgres",
+		"DATABASE_PASSWORD": "old-pass",
+		"DATABASE_NAME":     "olddb",
+		"EXTERNAL_URL":      "https://old.example.com",
+		"ADMIN_EMAIL":       "old@example.com",
+		"JWT_SECRET":        "keep-this-jwt",
+		"API_KEY_SECRET":    "keep-this-api",
+	}
+	r.Prompter = &FakePrompter{
+		Selects: map[string]int{
+			"What would you like to do?": 1, // Edit configuration
+			"Database setup":             1, // External PostgreSQL
+			"TLS/SSL setup":              1, // External SSL
+		},
+		Inputs: map[string]string{
+			"Database host":     "new-host.example.com", // changed
+			"Database port":     "5432",                 // kept
+			"Database user":     "postgres",             // kept
+			"Database password": "old-pass",             // kept
+			"Database name":     "olddb",                // kept
+			"External URL":      "https://old.example.com",
+			"Admin email":       "old@example.com",
+		},
+		IsTTY: true,
+	}
+
+	err := r.stepConfigure()
+	require.NoError(t, err)
+
+	env := r.Env.(*FakeEnvManager).Env
+	assert.Equal(t, "new-host.example.com", env["DATABASE_HOST"], "changed value updated")
+	assert.Equal(t, "old-pass", env["DATABASE_PASSWORD"], "unchanged value preserved")
+	assert.Equal(t, "keep-this-jwt", env["JWT_SECRET"], "secrets preserved on edit")
+	assert.Equal(t, "keep-this-api", env["API_KEY_SECRET"], "secrets preserved on edit")
+}
+
+// Test: Non-TTY returns CLIError
+func TestInteractive_NonTTYReturnsError(t *testing.T) {
+	r, _, _ := newTestSetupRunner()
+	r.Interactive = true
+	r.Prompter = &FakePrompter{IsTTY: false}
+
+	err := r.stepConfigure()
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "terminal")
+}
+
+// Test: Prompter error propagates
+func TestInteractive_PrompterErrorPropagates(t *testing.T) {
+	r, _, _ := newTestSetupRunner()
+	r.Interactive = true
+	r.Prompter = &FakePrompter{
+		IsTTY: true,
+		Err:   fmt.Errorf("user cancelled"),
+	}
+
+	err := r.stepConfigure()
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "user cancelled")
+}
+
+// Test: Empty password auto-generates
+func TestInteractive_EmptyPasswordAutoGenerates(t *testing.T) {
+	r, out, _ := newTestSetupRunner()
+	r.Interactive = true
+	r.Prompter = &FakePrompter{
+		Selects: map[string]int{
+			"Database setup": 0, // Local PostgreSQL
+			"TLS/SSL setup":  3, // No TLS
+		},
+		Inputs: map[string]string{
+			"Database password": "", // empty = auto-generate
+			"External URL":      "",
+			"Admin email":       "admin@heimdall.local",
+		},
+		IsTTY: true,
+	}
+
+	err := r.stepConfigure()
+	require.NoError(t, err)
+
+	env := r.Env.(*FakeEnvManager).Env
+	assert.NotEmpty(t, env["DATABASE_PASSWORD"], "empty input should auto-generate password")
+	assert.Contains(t, out.String(), "DATABASE_PASSWORD auto-generated")
+}
+
+// Test: Existing secrets preserved during interactive setup
+func TestInteractive_ExistingSecretsPreserved(t *testing.T) {
+	r, out, _ := newTestSetupRunner()
+	r.Interactive = true
+	r.Env.(*FakeEnvManager).Env = map[string]string{
+		"JWT_SECRET":     "existing-jwt",
+		"API_KEY_SECRET": "existing-api",
+	}
+	r.Prompter = &FakePrompter{
+		Selects: map[string]int{
+			"Database setup": 0, // Local PostgreSQL
+			"TLS/SSL setup":  0, // Caddy
+		},
+		Inputs: map[string]string{
+			"Database password": "pass",
+			"Confirm password":  "pass",
+			"External URL":      "",
+			"Admin email":       "admin@heimdall.local",
+		},
+		IsTTY: true,
+	}
+
+	err := r.stepConfigure()
+	require.NoError(t, err)
+
+	env := r.Env.(*FakeEnvManager).Env
+	assert.Equal(t, "existing-jwt", env["JWT_SECRET"], "existing JWT_SECRET preserved")
+	assert.Equal(t, "existing-api", env["API_KEY_SECRET"], "existing API_KEY_SECRET preserved")
+	assert.NotContains(t, out.String(), "JWT_SECRET auto-generated")
+}
+
+// Test: Secrets auto-generated when missing
+func TestInteractive_SecretsAutoGenerated(t *testing.T) {
+	r, out, _ := newTestSetupRunner()
+	r.Interactive = true
+	r.Prompter = &FakePrompter{
+		Selects: map[string]int{
+			"Database setup": 0, // Local PostgreSQL
+			"TLS/SSL setup":  0, // Caddy
+		},
+		Inputs: map[string]string{
+			"Database password": "pass",
+			"Confirm password":  "pass",
+			"External URL":      "",
+			"Admin email":       "admin@heimdall.local",
+		},
+		IsTTY: true,
+	}
+
+	err := r.stepConfigure()
+	require.NoError(t, err)
+
+	env := r.Env.(*FakeEnvManager).Env
+	assert.NotEmpty(t, env["JWT_SECRET"], "should auto-generate JWT_SECRET")
+	assert.NotEmpty(t, env["API_KEY_SECRET"], "should auto-generate API_KEY_SECRET")
+	assert.Contains(t, out.String(), "JWT_SECRET auto-generated")
+	assert.Contains(t, out.String(), "API_KEY_SECRET auto-generated")
+}
+
+// Test: External URL derives NGINX_HOST
+func TestInteractive_DeriveExternalURL(t *testing.T) {
+	r, _, _ := newTestSetupRunner()
+	r.Interactive = true
+	r.Prompter = &FakePrompter{
+		Selects: map[string]int{
+			"Database setup": 0, // Local
+			"TLS/SSL setup":  0, // Caddy
+		},
+		Inputs: map[string]string{
+			"Database password": "pass",
+			"Confirm password":  "pass",
+			"External URL":      "https://heimdall.example.com:443/app",
+			"Admin email":       "admin@heimdall.local",
+		},
+		IsTTY: true,
+	}
+
+	err := r.stepConfigure()
+	require.NoError(t, err)
+
+	env := r.Env.(*FakeEnvManager).Env
+	assert.Equal(t, "https://heimdall.example.com:443/app", env["EXTERNAL_URL"])
+	assert.Equal(t, "heimdall.example.com", env["NGINX_HOST"], "NGINX_HOST derived from URL")
+}
+
+// Test: HTTP URL derives NGINX_HOST correctly
+func TestInteractive_URLDerivesNginxHostFromHTTP(t *testing.T) {
+	r, _, _ := newTestSetupRunner()
+	r.Interactive = true
+	r.Prompter = &FakePrompter{
+		Selects: map[string]int{
+			"Database setup": 0,
+			"TLS/SSL setup":  0,
+		},
+		Inputs: map[string]string{
+			"Database password": "pass",
+			"Confirm password":  "pass",
+			"External URL":      "http://heimdall.internal:8080/path",
+			"Admin email":       "admin@heimdall.local",
+		},
+		IsTTY: true,
+	}
+
+	err := r.stepConfigure()
+	require.NoError(t, err)
+
+	env := r.Env.(*FakeEnvManager).Env
+	assert.Equal(t, "heimdall.internal", env["NGINX_HOST"], "NGINX_HOST derived from http:// URL")
+}
+
+// Test: Empty URL derives from localhost for local DB
+func TestInteractive_EmptyURLDerivesFromHost(t *testing.T) {
+	r, _, _ := newTestSetupRunner()
+	r.Interactive = true
+	r.Prompter = &FakePrompter{
+		Selects: map[string]int{
+			"Database setup": 0, // Local
+			"TLS/SSL setup":  0, // Caddy
+		},
+		Inputs: map[string]string{
+			"Database password": "pass",
+			"Confirm password":  "pass",
+			"External URL":      "",
+			"Admin email":       "admin@heimdall.local",
+		},
+		IsTTY: true,
+	}
+
+	err := r.stepConfigure()
+	require.NoError(t, err)
+
+	env := r.Env.(*FakeEnvManager).Env
+	// When external URL is empty, nginxHost comes from dbHost (localhost),
+	// and externalURL = "https://" + nginxHost
+	assert.Equal(t, "https://localhost", env["EXTERNAL_URL"])
+	assert.Equal(t, "localhost", env["NGINX_HOST"])
+}
+
+// Test: --interactive flag works end-to-end through cobra
+func TestSetupCmd_InteractiveFlagWorks(t *testing.T) {
+	r, _, _ := newTestSetupRunner()
+	stubLocalPostgresHappy(r)
+	r.Prompter = &FakePrompter{
+		Selects: map[string]int{
+			"Database setup": 0, // Local
+			"TLS/SSL setup":  3, // No TLS (avoids TLS step)
+		},
+		Inputs: map[string]string{
+			"Database password": "testpass",
+			"Confirm password":  "testpass",
+			"External URL":      "",
+			"Admin email":       "admin@heimdall.local",
+		},
+		IsTTY: true,
+	}
+	cmd := NewSetupCmd(r)
+	cmd.SetArgs([]string{"--interactive"})
+	err := cmd.Execute()
+	require.NoError(t, err)
+
+	env := r.Env.(*FakeEnvManager).Env
+	assert.Equal(t, "testpass", env["DATABASE_PASSWORD"])
+}
+
+// Test: Re-run "start fresh" clears existing and runs full wizard
+func TestInteractive_StartFresh(t *testing.T) {
+	r, _, _ := newTestSetupRunner()
+	r.Interactive = true
+	r.Env.(*FakeEnvManager).Env = map[string]string{
+		"DATABASE_HOST":     "old-host.example.com",
+		"DATABASE_PASSWORD": "old-pass",
+		"JWT_SECRET":        "old-jwt",
+		"API_KEY_SECRET":    "old-api",
+	}
+	r.Prompter = &FakePrompter{
+		Selects: map[string]int{
+			"What would you like to do?": 2, // Start fresh
+			"Database setup":             0, // Local
+			"TLS/SSL setup":              3, // No TLS
+		},
+		Inputs: map[string]string{
+			"Database password": "fresh-pass",
+			"Confirm password":  "fresh-pass",
+			"External URL":      "",
+			"Admin email":       "admin@heimdall.local",
+		},
+		IsTTY: true,
+	}
+
+	err := r.stepConfigure()
+	require.NoError(t, err)
+
+	env := r.Env.(*FakeEnvManager).Env
+	assert.Equal(t, "localhost", env["DATABASE_HOST"], "start fresh uses defaults")
+	assert.Equal(t, "fresh-pass", env["DATABASE_PASSWORD"], "start fresh uses new password")
+	// Secrets should be newly generated (old ones cleared)
+	assert.NotEqual(t, "old-jwt", env["JWT_SECRET"], "start fresh generates new JWT secret")
+	assert.NotEqual(t, "old-api", env["API_KEY_SECRET"], "start fresh generates new API secret")
+}
+
+func TestWriteConfig_AdminPasswordPreserved(t *testing.T) {
+	r, _, _ := newTestSetupRunner()
+	r.Env.(*FakeEnvManager).Env = map[string]string{
+		"ADMIN_PASSWORD": "existing-admin-pass",
+	}
+
+	err := r.stepConfigure()
+	require.NoError(t, err)
+
+	env := r.Env.(*FakeEnvManager).Env
+	assert.Equal(t, "existing-admin-pass", env["ADMIN_PASSWORD"],
+		"ADMIN_PASSWORD should be preserved when present in existing env")
+}
+
+func TestWriteConfig_AdminPasswordAbsent(t *testing.T) {
+	r, _, _ := newTestSetupRunner()
+	r.Env.(*FakeEnvManager).Env = map[string]string{}
+
+	err := r.stepConfigure()
+	require.NoError(t, err)
+
+	env := r.Env.(*FakeEnvManager).Env
+	_, hasAdminPassword := env["ADMIN_PASSWORD"]
+	assert.False(t, hasAdminPassword,
+		"ADMIN_PASSWORD should NOT be written when not in existing env")
+}
+
+func TestWriteConfig_PreservesPortAndJWTExpire(t *testing.T) {
+	r, _, _ := newTestSetupRunner()
+	r.Env.(*FakeEnvManager).Env = map[string]string{
+		"PORT":            "8080",
+		"JWT_EXPIRE_TIME": "7d",
+	}
+
+	err := r.stepConfigure()
+	require.NoError(t, err)
+
+	env := r.Env.(*FakeEnvManager).Env
+	assert.Equal(t, "8080", env["PORT"], "existing PORT should be preserved")
+	assert.Equal(t, "7d", env["JWT_EXPIRE_TIME"], "existing JWT_EXPIRE_TIME should be preserved")
+}
+
+func TestSetupCmd_DryRun_ShowsBYOCert(t *testing.T) {
+	r, out, _ := newTestSetupRunner()
+	r.DryRun = true
+	cmd := NewSetupCmd(r)
+	cmd.SetArgs([]string{
+		"--dry-run", "--non-interactive",
+		"--tls-cert", "/path/to/cert.pem",
+		"--tls-key", "/path/to/key.pem",
+	})
+	err := cmd.Execute()
+	require.NoError(t, err)
+	output := out.String()
+	assert.Contains(t, output, "Cert: /path/to/cert.pem")
+	assert.Contains(t, output, "Key: /path/to/key.pem")
+}
+
+func TestSetupCmd_DryRun_AutoGeneratePasswordMessage(t *testing.T) {
+	r, out, _ := newTestSetupRunner()
+	r.DryRun = true
+	cmd := NewSetupCmd(r)
+	cmd.SetArgs([]string{"--dry-run", "--non-interactive"})
+	err := cmd.Execute()
+	require.NoError(t, err)
+	output := out.String()
+	assert.Contains(t, output, "would auto-generate")
+}
+
+func TestSetupCmd_PrintSummary_SkipDB(t *testing.T) {
+	r, out, _ := newTestSetupRunner()
+	r.SkipDB = true
+	r.printSummary(true)
+	output := out.String()
+	assert.Contains(t, output, "skip (--skip-db)")
+}
+
+func TestSetupCmd_PrintSummary_ExternalDB(t *testing.T) {
+	r, out, _ := newTestSetupRunner()
+	r.printSummary(false)
+	output := out.String()
+	assert.Contains(t, output, "skip (external database)")
+}
+
+func TestSetupCmd_PrintSummary_LocalDB(t *testing.T) {
+	r, out, _ := newTestSetupRunner()
+	r.printSummary(true)
+	output := out.String()
+	assert.Contains(t, output, "PostgreSQL bootstrap: run")
+	assert.Contains(t, output, "Database migrations:  run")
+}
+
+func TestSetupCmd_PrintSummary_SkipTLS(t *testing.T) {
+	r, out, _ := newTestSetupRunner()
+	r.SkipTLS = true
+	r.printSummary(true)
+	output := out.String()
+	assert.Contains(t, output, "skip (--skip-tls)")
+}
+
+func TestSetupCmd_PrintSummary_RunTLS(t *testing.T) {
+	r, out, _ := newTestSetupRunner()
+	r.printSummary(true)
+	output := out.String()
+	assert.Contains(t, output, "TLS reverse proxy:    run")
+}
+
+func TestRestore_ConfirmationAccepted(t *testing.T) {
+	fs := NewFakeFileSystem()
+	fs.Files["/tmp/backup.tar.gz"] = []byte("fake")
+	fs.Files["/tmp/heimdall-restore--fake/backend.env"] = []byte("PORT=3000\n")
+
+	r := &RestoreRunner{
+		Exec: &FakeExecRunner{Results: map[string]FakeExecResult{
+			"tar xzf":             {ExitCode: 0},
+			"chown root:heimdall": {ExitCode: 0},
+		}},
+		Env:      &FakeEnvManager{Env: map[string]string{}, Path: "/etc/heimdall-server/backend.env"},
+		FS:       fs,
+		Out:      new(bytes.Buffer),
+		ErrOut:   new(bytes.Buffer),
+		Prompter: &FakePrompter{Confirms: map[string]bool{"Restore will overwrite current config and database. Continue?": true}, IsTTY: true},
+	}
+	err := r.Run("/tmp/backup.tar.gz")
+	assert.NoError(t, err)
+	assert.Contains(t, r.Out.(*bytes.Buffer).String(), "Config:   restored")
+}
+
+// --- Connectivity validation tests ---
+
+func TestInteractive_ExternalDB_ConnectivityTestPasses(t *testing.T) {
+	r, out, _ := newTestSetupRunner()
+	r.Interactive = true
+	r.DB.(*FakeDBConnector).ConnErr = nil // connection succeeds
+	r.Prompter = &FakePrompter{
+		Selects: map[string]int{
+			"Database setup": 1, // External
+			"TLS/SSL setup":  3, // No TLS
+		},
+		Inputs: map[string]string{
+			"Database host":     "db.example.com",
+			"Database port":     "5432",
+			"Database user":     "postgres",
+			"Database password": "pass123",
+			"Confirm password":  "pass123",
+			"Database name":     "heimdall",
+			"External URL":      "",
+			"Admin email":       "admin@heimdall.local",
+		},
+		IsTTY: true,
+	}
+
+	err := r.stepConfigure()
+	require.NoError(t, err)
+	assert.Contains(t, out.String(), "connected")
+}
+
+func TestInteractive_ExternalDB_ConnectivityTestFails(t *testing.T) {
+	r, out, _ := newTestSetupRunner()
+	r.Interactive = true
+	r.DB.(*FakeDBConnector).ConnErr = fmt.Errorf("connection refused")
+	r.Prompter = &FakePrompter{
+		Selects: map[string]int{
+			"Database setup":                       1, // External
+			"TLS/SSL setup":                        3, // No TLS
+			"Connection failed. What would you do?": 1, // Continue anyway
+		},
+		Inputs: map[string]string{
+			"Database host":     "db.example.com",
+			"Database port":     "5432",
+			"Database user":     "postgres",
+			"Database password": "pass123",
+			"Confirm password":  "pass123",
+			"Database name":     "heimdall",
+			"External URL":      "",
+			"Admin email":       "admin@heimdall.local",
+		},
+		IsTTY: true,
+	}
+
+	err := r.stepConfigure()
+	require.NoError(t, err)
+	assert.Contains(t, out.String(), "connection refused")
+	assert.Contains(t, out.String(), "continuing without verified connection")
+}
+
+func TestInteractive_ExternalDB_ConnectivityTestFails_Abort(t *testing.T) {
+	r, _, _ := newTestSetupRunner()
+	r.Interactive = true
+	r.DB.(*FakeDBConnector).ConnErr = fmt.Errorf("connection refused")
+	r.Prompter = &FakePrompter{
+		Selects: map[string]int{
+			"Database setup":                       1, // External
+			"Connection failed. What would you do?": 0, // Abort
+		},
+		Inputs: map[string]string{
+			"Database host":     "db.example.com",
+			"Database port":     "5432",
+			"Database user":     "postgres",
+			"Database password": "pass123",
+			"Confirm password":  "pass123",
+			"Database name":     "heimdall",
+		},
+		IsTTY: true,
+	}
+
+	err := r.stepConfigure()
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "database connection failed")
+}
+
+func TestInteractive_LocalDB_SkipsConnectivityTest(t *testing.T) {
+	r, out, _ := newTestSetupRunner()
+	r.Interactive = true
+	r.Prompter = &FakePrompter{
+		Selects: map[string]int{
+			"Database setup": 0, // Local
+			"TLS/SSL setup":  3, // No TLS
+		},
+		Inputs: map[string]string{
+			"Database password": "pass",
+			"Confirm password":  "pass",
+			"External URL":      "",
+			"Admin email":       "admin@heimdall.local",
+		},
+		IsTTY: true,
+	}
+
+	err := r.stepConfigure()
+	require.NoError(t, err)
+	// Should NOT contain connectivity test output for local DB
+	assert.NotContains(t, out.String(), "Testing connection")
+}
+
+// --- DryRun tests ---
+
+func TestSetupCmd_DryRun_PrintsPlanWithoutExecuting(t *testing.T) {
+	r, out, _ := newTestSetupRunner()
+	r.DryRun = true
+	cmd := NewSetupCmd(r)
+	cmd.SetArgs([]string{"--dry-run", "--non-interactive", "--db-password", "testpass"})
+	err := cmd.Execute()
+	require.NoError(t, err)
+	output := out.String()
+
+	// Should show the plan
+	assert.Contains(t, output, "DRY RUN")
+	assert.Contains(t, output, "Step 1/7")
+	assert.Contains(t, output, "Step 7/7")
+
+	// Should NOT have actually written config or started the service
+	exec := r.Exec.(*FakeExecRunner)
+	for _, call := range exec.Calls {
+		assert.NotEqual(t, "chown", call.Name, "chown should not be called in dry-run")
+		assert.NotEqual(t, "chmod", call.Name, "chmod should not be called in dry-run")
+	}
+	systemd := r.Systemd.(*FakeSystemdRunner)
+	assert.Empty(t, systemd.Actions, "no systemd actions should occur in dry-run")
+}
+
+func TestSetupCmd_DryRun_ShowsSkippedSteps(t *testing.T) {
+	r, out, _ := newTestSetupRunner()
+	r.DryRun = true
+	cmd := NewSetupCmd(r)
+	cmd.SetArgs([]string{"--dry-run", "--non-interactive", "--skip-db", "--skip-tls"})
+	err := cmd.Execute()
+	require.NoError(t, err)
+	output := out.String()
+	assert.Contains(t, output, "DRY RUN")
+	assert.Contains(t, output, "skipped")
+}

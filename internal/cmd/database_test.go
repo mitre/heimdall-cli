@@ -1,0 +1,92 @@
+package cmd
+
+import (
+	"testing"
+
+	"github.com/stretchr/testify/assert"
+)
+
+func TestExtractDBConfig_AllDefaults(t *testing.T) {
+	cfg := ExtractDBConfig(map[string]string{})
+
+	assert.Equal(t, "localhost", cfg.Host)
+	assert.Equal(t, DefaultDBPort, cfg.Port)
+	assert.Equal(t, "postgres", cfg.User)
+	assert.Equal(t, "", cfg.Password)
+	assert.Equal(t, "heimdall-server-production", cfg.DBName)
+}
+
+func TestExtractDBConfig_CustomValues(t *testing.T) {
+	env := map[string]string{
+		"DATABASE_HOST":     "db.example.com",
+		"DATABASE_PORT":     "5433",
+		"DATABASE_USERNAME": "heimdall",
+		"DATABASE_PASSWORD": "s3cret",
+		"DATABASE_NAME":     "mydb",
+	}
+	cfg := ExtractDBConfig(env)
+
+	assert.Equal(t, "db.example.com", cfg.Host)
+	assert.Equal(t, 5433, cfg.Port)
+	assert.Equal(t, "heimdall", cfg.User)
+	assert.Equal(t, "s3cret", cfg.Password)
+	assert.Equal(t, "mydb", cfg.DBName)
+}
+
+func TestExtractDBConfig_PartialOverrides(t *testing.T) {
+	env := map[string]string{
+		"DATABASE_HOST":     "remote-host",
+		"DATABASE_PASSWORD": "pass",
+	}
+	cfg := ExtractDBConfig(env)
+
+	assert.Equal(t, "remote-host", cfg.Host)
+	assert.Equal(t, DefaultDBPort, cfg.Port, "port should default when not set")
+	assert.Equal(t, "postgres", cfg.User, "user should default when not set")
+	assert.Equal(t, "pass", cfg.Password)
+	assert.Equal(t, "heimdall-server-production", cfg.DBName, "db name should default when not set")
+}
+
+func TestExtractDBConfig_InvalidPort_FallsBackToDefault(t *testing.T) {
+	env := map[string]string{
+		"DATABASE_PORT": "notanumber",
+	}
+	cfg := ExtractDBConfig(env)
+
+	assert.Equal(t, DefaultDBPort, cfg.Port, "invalid port string should fall back to default")
+}
+
+func TestExtractDBConfig_EmptyPort_FallsBackToDefault(t *testing.T) {
+	env := map[string]string{
+		"DATABASE_PORT": "",
+	}
+	cfg := ExtractDBConfig(env)
+
+	assert.Equal(t, DefaultDBPort, cfg.Port, "empty port should fall back to default")
+}
+
+func TestPortStr(t *testing.T) {
+	tests := []struct {
+		name string
+		port int
+		want string
+	}{
+		{"default port", 5432, "5432"},
+		{"custom port", 5433, "5433"},
+		{"port 1", 1, "1"},
+		{"high port", 65535, "65535"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			cfg := DBConfig{Port: tt.port}
+			assert.Equal(t, tt.want, cfg.PortStr())
+		})
+	}
+}
+
+func TestExtractDBConfig_NilMap(t *testing.T) {
+	// nil map should not panic — envDefault handles it
+	cfg := ExtractDBConfig(nil)
+	assert.Equal(t, "localhost", cfg.Host)
+	assert.Equal(t, DefaultDBPort, cfg.Port)
+}
